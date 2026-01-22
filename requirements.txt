@@ -1,0 +1,8 @@
+httpx
+beautifulsoup4
+openai
+pydantic
+pandas
+python-dotenv
+openpyxl
+playwright

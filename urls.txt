@@ -1,0 +1,23 @@
+# Add your URLs below - one per line
+# Format: company_name = url
+# Example: Pfizer = https://www.pfizer.com/pipeline
+
+url1 = https://oscotec.co.kr/pline
+url2 = https://www.gcbiopharma.com/eng/pipeline.do
+url3 = https://ablbio.com/en/company/pipeline02
+url4 = https://ablbio.com/en/company/pipeline03
+url5 = https://ablbio.com/en/company/pipeline04
+url6 = https://ablbio.com/en/company/pipeline05
+url7 = https://ablbio.com/en/company/pipeline06
+url8 = https://ablbio.com/en/company/pipeline07
+url9 = https://ablbio.com/en/company/pipeline08
+url10 = https://ablbio.com/en/company/pipeline09
+url11 = https://ablbio.com/en/company/pipeline10
+url12 = https://ablbio.com/en/company/pipeline11
+url13 = https://adelpharm.com/en/pipeline/
+url14 = http://www.daewoongchemical.com/Contents/Contents.asp?DirName=rnd&FileName=pipeline
+url15 = https://www.aimedbio.com/science/science_02.php
+url16 = https://www.rznomics.com/pipeline/pipeline.php
+url17 = https://en.medi-post.co.kr/development/
+url18 = https://pangen.com/layout/eng/home.php?go=research1
+url19 = https://www.nature.com/articles/d43747-020-00274-2

@@ -1,0 +1,45 @@
+{
+  "fields": [
+    {
+      "name": "Therapeutic Area",
+      "type": "text",
+      "aliases": ["area", "therapy area", "disease area"]
+    },
+    {
+      "name": "Modality",
+      "type": "text",
+      "aliases": ["platform", "technology", "drug type"]
+    },
+    {
+      "name": "Phase",
+      "type": "phase",
+      "aliases": ["stage", "development phase", "clinical stage"]
+    },
+    {
+      "name": "Asset Name",
+      "type": "text",
+      "required": true,
+      "aliases": ["drug", "compound", "candidate", "program"]
+    },
+    {
+      "name": "Description",
+      "type": "text",
+      "aliases": ["summary", "mechanism", "moa"]
+    },
+    {
+      "name": "Therapeutic Target",
+      "type": "text",
+      "aliases": ["target", "molecular target"]
+    },
+    {
+      "name": "Indication",
+      "type": "text",
+      "aliases": ["disease", "condition"]
+    },
+    {
+      "name": "Company",
+      "type": "text",
+      "aliases": ["sponsor", "developer"]
+    }
+  ]
+}
