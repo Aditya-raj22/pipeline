@@ -47,31 +47,57 @@ Source: {url}
 Content:
 {content}
 
-For each asset, extract these fields:
-- therapeutic_area: e.g., "Oncology", "Neurology", "Ophthalmology", "Dermatology / Fibrosis"
-- modality: Include delivery route if stated, e.g., "Bispecific Antibody", "GalNAc-asiRNA (subcutaneous)"
-- phase: Use exact value from page. Valid: Preclinical, Phase 1, Phase 1/2, Phase 2, Phase 2/3, Phase 3, Filed, Approved, IND enabling study, Phase 1 completed, Discovery, Platform
-- asset_name: Drug/compound code (e.g., "ABL001", "OLX10212") or name
+IMPORTANT: An "asset" is a DRUG or COMPOUND being developed, identified by:
+- A code name (e.g., "ABL001", "SKI-O-703", "OLX10212")
+- A proprietary drug name (e.g., "Lazertinib", "Cevidoplenib")
+- "TBD" or "Undisclosed" if the drug name is not yet announced - INCLUDE THESE, they are valid assets
+
+Do NOT create assets from:
+- Disease names alone (e.g., "ITP", "NSCLC", "Breast Cancer") - these are INDICATIONS
+- Target names alone (e.g., "EGFR", "PD-L1") - these are THERAPEUTIC TARGETS
+- Modality types alone (e.g., "mAb", "siRNA") - these are MODALITIES
+
+MULTIPLE INDICATIONS - IMPORTANT:
+- If a drug has multiple indications at the SAME phase: COMBINE all indications with semicolons
+  Example: "Lazertinib" Phase 2 for NSCLC, Breast Cancer, Gastric Cancer → indication: "NSCLC; Breast Cancer; Gastric Cancer"
+- If a drug has indications at DIFFERENT phases: create SEPARATE entries for each phase
+  Example: "Lazertinib" Phase 3 for NSCLC, Phase 2 for Breast Cancer → two separate assets
+
+CRITICAL: Do NOT discard any indications. Capture ALL listed indications for each drug.
+
+For each DRUG asset, extract:
+- asset_name: The drug code or name. Use "TBD" if shown as TBD/undisclosed but still listed as an asset
+- therapeutic_area: e.g., "Oncology", "Neurology", "Immunology"
+- modality: Drug type, e.g., "Small molecule", "Bispecific Antibody", "siRNA"
+- phase: Exact value from page (Preclinical, Phase 1, Phase 1/2, Phase 2, Phase 3, Filed, Approved)
 - description: Mechanism of action or brief summary
-- therapeutic_target: Molecular target (e.g., "VEGF/DLL4", "PD-L1/4-1BB")
-- indication: Disease/condition
+- therapeutic_target: Molecular target (e.g., "EGFR", "PD-L1/4-1BB")
+- indication: Disease being treated (e.g., "NSCLC", "ITP", "Solid tumors")
+
+IMPORTANT: TBD/undisclosed assets are valuable - include them with "TBD" as the asset_name.
 
 Return JSON array of assets. Use empty string for unknown fields."""
 
-VISION_PROMPT = """Extract pharmaceutical pipeline data from this image.
+VISION_PROMPT = """Extract ALL pharmaceutical pipeline assets from this image.
 Company: {company}
 
-The image may contain:
+IMPORTANT: Scan the ENTIRE image carefully. Assets may appear in:
+- Honeycomb/hexagon diagrams (check ALL hexagons, left AND right sides)
 - Tables with drug information
-- Visual phase indicators (colored bars showing development stage)
-- Pipeline charts or diagrams
+- Pipeline charts or flowcharts
+- Small text labels near diagrams
+- Multiple sections/columns
+
+Look for drug codes like: NCP101, NCT201, ABL001, etc. - ANY alphanumeric code is likely an asset.
 
 For visual phase indicators:
 - Solid filled section = completed
 - Partial fill or current marker = ongoing
 - Map to: Preclinical, Phase 1, Phase 1/2, Phase 2, Phase 2/3, Phase 3, Filed, Approved
 
-Extract ALL assets visible. Return JSON matching schema."""
+CRITICAL: Do NOT miss any assets. Extract EVERY drug/compound code visible in the image, even if details are limited. Use empty string for unknown fields.
+
+Return JSON matching schema."""
 
 
 async def extract_with_text(
@@ -174,27 +200,46 @@ async def extract_from_content(
     return []
 
 
+def normalize_asset_name(name: str) -> str:
+    """Normalize asset name for matching - remove parenthetical codes."""
+    import re
+    # Remove parenthetical content like "(TTAC-0001)"
+    name = re.sub(r'\s*\([^)]+\)', '', name)
+    # Remove trailing codes after space
+    name = name.split()[0] if name else name
+    return name.strip().upper()
+
+
 def merge_assets(existing: list[ExtractedAsset], new: list[ExtractedAsset]) -> list[ExtractedAsset]:
     """
     Merge new assets into existing list.
-    Updates existing assets with more detail, adds new ones.
+    Only updates existing assets with more detail - does NOT add new ones.
+    Matches by normalized asset name (ignores phase for matching).
     """
-    # Index by asset_name
-    by_name = {a.asset_name.upper(): a for a in existing}
+    # Index by normalized asset name
+    by_name = {}
+    for a in existing:
+        norm_name = normalize_asset_name(a.asset_name)
+        if norm_name not in by_name:
+            by_name[norm_name] = a
 
     for asset in new:
-        key = asset.asset_name.upper()
-        if key in by_name:
+        norm_name = normalize_asset_name(asset.asset_name)
+        if norm_name in by_name:
             # Merge: prefer non-empty values from new
-            old = by_name[key]
-            for field in ["therapeutic_area", "modality", "phase", "description",
+            old = by_name[norm_name]
+            for field in ["therapeutic_area", "modality", "description",
                           "therapeutic_target", "indication"]:
                 new_val = getattr(asset, field)
                 old_val = getattr(old, field)
-                if new_val and (not old_val or old_val == ""):
-                    setattr(old, field, new_val)
-        else:
-            by_name[key] = asset
+                # Update if new has value and old is empty/TBD/Undisclosed
+                if new_val and new_val not in ["", "TBD", "Undisclosed"]:
+                    if not old_val or old_val in ["", "TBD", "Undisclosed"]:
+                        setattr(old, field, new_val)
+                    elif new_val not in old_val:
+                        # Append if different (for multiple indications)
+                        setattr(old, field, f"{old_val}; {new_val}")
+        # Skip assets not in overview
 
     return list(by_name.values())
 

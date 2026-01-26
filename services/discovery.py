@@ -185,9 +185,21 @@ async def discover_pipeline_urls(
     # Classify all URLs
     discovered = await classify_urls(company, all_results[:max_results])
 
-    # Sort: overview first, then by relevance
+    # Sort: overview first, prefer main domain, then by relevance
     type_priority = {"overview": 0, "drug_specific": 1, "news": 2, "irrelevant": 3}
-    discovered.sort(key=lambda x: (type_priority.get(x.url_type, 3), -x.relevance_score))
+    company_lower = company.lower().replace(" ", "")
+
+    def sort_key(x):
+        type_score = type_priority.get(x.url_type, 3)
+        # Prefer URLs with www. (main domain) over regional variants
+        is_main_domain = 1 if "www." in x.url else 0
+        # Prefer .com over regional TLDs
+        is_com = 1 if ".com" in x.url else 0
+        # Deprioritize regional variants (.us, .eu, .uk, etc)
+        is_regional = 1 if any(f".{r}" in x.url for r in ["us", "eu", "uk", "de", "jp", "kr"]) else 0
+        return (type_score, -is_main_domain, -is_com, is_regional, -x.relevance_score)
+
+    discovered.sort(key=sort_key)
 
     return discovered
 

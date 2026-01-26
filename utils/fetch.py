@@ -223,10 +223,23 @@ def filter_pipeline_links(base_url: str, links: list[str], company: str) -> list
 
     Returns list of absolute URLs.
     """
+    import re
     from urllib.parse import urlparse
 
     base_domain = urlparse(base_url).netloc
     pipeline_links = []
+
+    # Patterns for drug codes (e.g., PMC-309, NCP101, ABL001, HL036)
+    drug_code_pattern = re.compile(r'^/?[A-Z]{2,4}[-_]?\d{2,4}[A-Za-z]?$', re.IGNORECASE)
+    # Pattern for drug names (single capitalized word, 5+ chars)
+    drug_name_pattern = re.compile(r'^/?[A-Z][a-z]{4,}$')
+
+    skip_patterns = [
+        "news", "press", "career", "contact", "investor",
+        "about", "team", "leadership", "login", "logout",
+        "board", "history", "technology", "partner", "media",
+        "procedure", "recruit", "executive", "bod", "sab"
+    ]
 
     for href in links:
         url = resolve_url(base_url, href)
@@ -236,19 +249,28 @@ def filter_pipeline_links(base_url: str, links: list[str], company: str) -> list
         if parsed.netloc != base_domain:
             continue
 
-        path = parsed.path.lower()
+        path = parsed.path
+        path_lower = path.lower()
 
-        # Look for pipeline/drug page patterns
-        if any(pattern in path for pattern in [
+        # Skip common non-drug pages
+        if any(skip in path_lower for skip in skip_patterns):
+            continue
+
+        # Check for pipeline/drug page patterns
+        is_pipeline_page = any(pattern in path_lower for pattern in [
             "pipeline", "product", "drug", "candidate", "program",
             "rnd", "r-d", "research", "development"
-        ]):
-            # Exclude non-detail pages
-            if not any(skip in path for skip in [
-                "news", "press", "career", "contact", "investor",
-                "about", "team", "leadership"
-            ]):
-                if url not in pipeline_links:
-                    pipeline_links.append(url)
+        ])
+
+        # Check for drug code pattern (e.g., /PMC-309, /NCP101)
+        path_segment = path.rstrip('/').split('/')[-1] if path else ""
+        is_drug_code = bool(drug_code_pattern.match(path_segment))
+
+        # Check for drug name pattern (e.g., /Olinvacimab)
+        is_drug_name = bool(drug_name_pattern.match(path_segment)) and len(path_segment) > 5
+
+        if (is_pipeline_page or is_drug_code or is_drug_name):
+            if url not in pipeline_links:
+                pipeline_links.append(url)
 
     return pipeline_links
