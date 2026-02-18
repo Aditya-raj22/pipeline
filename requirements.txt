@@ -8,4 +8,4 @@ openpyxl
 playwright
 fastapi
 uvicorn[standard]
-streamlit
+streamlit>=1.38.0
