@@ -1,7 +1,10 @@
 """DuckDuckGo search utility - replaces Serper (free, no API key)."""
 import asyncio
 from dataclasses import dataclass
-from ddgs import DDGS
+try:
+    from ddgs import DDGS
+except ImportError:
+    from duckduckgo_search import DDGS
 
 
 @dataclass
