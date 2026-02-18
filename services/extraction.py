@@ -1,11 +1,10 @@
-"""Pipeline extraction service - extracts assets from pipeline pages."""
+"""Pipeline extraction service - vision-first with tiled screenshots."""
 import asyncio
 import base64
-from typing import Optional
 from openai import AsyncOpenAI
 from pydantic import ValidationError
 from config import config
-from models.extracted import ExtractedAsset, PipelineResponse, LLMAsset
+from models.extracted import ExtractedAsset, PipelineResponse
 from utils.fetch import FetchResult, fetch_content, filter_pipeline_links, close_browser
 
 client = AsyncOpenAI(api_key=config.openai_api_key)
@@ -16,12 +15,9 @@ def _make_schema():
     schema = PipelineResponse.model_json_schema()
 
     def fix_for_openai(obj):
-        """Fix schema for OpenAI strict mode requirements."""
         if isinstance(obj, dict):
-            # OpenAI requires additionalProperties: false
             if "properties" in obj:
                 obj["additionalProperties"] = False
-                # OpenAI requires ALL properties in required array
                 obj["required"] = list(obj["properties"].keys())
             for v in obj.values():
                 fix_for_openai(v)
@@ -30,7 +26,6 @@ def _make_schema():
                 fix_for_openai(item)
 
     fix_for_openai(schema)
-    # Also fix $defs
     if "$defs" in schema:
         for defn in schema["$defs"].values():
             fix_for_openai(defn)
@@ -40,110 +35,116 @@ def _make_schema():
 SCHEMA = _make_schema()
 
 
-EXTRACTION_PROMPT = """Extract all pharmaceutical pipeline assets from this content.
+TEXT_PROMPT = """Extract ALL pharmaceutical pipeline assets from this text content of a pipeline page.
 Company: {company}
 Source: {url}
 
-Content:
-{content}
+Page content:
+{text}
 
 IMPORTANT: An "asset" is a DRUG or COMPOUND being developed, identified by:
-- A code name (e.g., "ABL001", "SKI-O-703", "OLX10212")
+- A code name (e.g., "ABL001", "ORM-1153", "SKI-O-703")
 - A proprietary drug name (e.g., "Lazertinib", "Cevidoplenib")
-- "TBD" or "Undisclosed" if the drug name is not yet announced - INCLUDE THESE, they are valid assets
+- "TBD" or "Undisclosed" if the drug name is not yet announced - INCLUDE THESE
 
 Do NOT create assets from:
-- Disease names alone (e.g., "ITP", "NSCLC", "Breast Cancer") - these are INDICATIONS
-- Target names alone (e.g., "EGFR", "PD-L1") - these are THERAPEUTIC TARGETS
-- Modality types alone (e.g., "mAb", "siRNA") - these are MODALITIES
+- Disease names alone (these are INDICATIONS)
+- Target names alone (these are THERAPEUTIC TARGETS)
+- Modality types alone (these are MODALITIES)
 
-MULTIPLE INDICATIONS - IMPORTANT:
-- If a drug has multiple indications at the SAME phase: COMBINE all indications with semicolons
-  Example: "Lazertinib" Phase 2 for NSCLC, Breast Cancer, Gastric Cancer → indication: "NSCLC; Breast Cancer; Gastric Cancer"
-- If a drug has indications at DIFFERENT phases: create SEPARATE entries for each phase
-  Example: "Lazertinib" Phase 3 for NSCLC, Phase 2 for Breast Cancer → two separate assets
+MULTIPLE INDICATIONS:
+- Same phase: combine with semicolons (e.g., "NSCLC; Breast Cancer")
+- Different phases: create separate entries
 
-CRITICAL: Do NOT discard any indications. Capture ALL listed indications for each drug.
+For each DRUG asset extract:
+- asset_name: Drug code or name ("TBD" if undisclosed)
+- therapeutic_area: e.g., "Oncology", "Neurology"
+- modality: e.g., "Small molecule", "Bispecific Antibody"
+- phase: Preclinical, IND-enabling, Phase 1, Phase 1/2, Phase 2, Phase 3, Filed, Approved
+- description: Mechanism of action
+- therapeutic_target: Molecular target (e.g., "CD33", "EGFR"). If target is undisclosed/masked (e.g., "Target A"), use empty string.
+- indication: The DISEASE being treated (e.g., "AML", "NSCLC"). Must be a disease/condition, NOT a target, NOT a modality, NOT a treatment regimen. If undisclosed, use empty string.
 
-For each DRUG asset, extract:
-- asset_name: The drug code or name. Use "TBD" if shown as TBD/undisclosed but still listed as an asset
-- therapeutic_area: e.g., "Oncology", "Neurology", "Immunology"
-- modality: Drug type, e.g., "Small molecule", "Bispecific Antibody", "siRNA"
-- phase: Exact value from page (Preclinical, Phase 1, Phase 1/2, Phase 2, Phase 3, Filed, Approved)
-- description: Mechanism of action or brief summary
-- therapeutic_target: Molecular target (e.g., "EGFR", "PD-L1/4-1BB")
-- indication: Disease being treated (e.g., "NSCLC", "ITP", "Solid tumors")
+CRITICAL: Do NOT miss any assets. Extract EVERY drug mentioned.
+Use empty string for unknown fields."""
 
-IMPORTANT: TBD/undisclosed assets are valuable - include them with "TBD" as the asset_name.
 
-Return JSON array of assets. Use empty string for unknown fields."""
-
-VISION_PROMPT = """Extract ALL pharmaceutical pipeline assets from this image.
+VISION_PROMPT = """Extract ALL pharmaceutical pipeline assets from these screenshots of a pipeline page.
 Company: {company}
+Source: {url}
 
-IMPORTANT: Scan the ENTIRE image carefully. Assets may appear in:
-- Honeycomb/hexagon diagrams (check ALL hexagons, left AND right sides)
-- Tables with drug information
-- Pipeline charts or flowcharts
-- Small text labels near diagrams
-- Multiple sections/columns
+The screenshots are TILED sections of the same page, shown top-to-bottom. Together they show the complete page.
 
-Look for drug codes like: NCP101, NCT201, ABL001, etc. - ANY alphanumeric code is likely an asset.
+IMPORTANT: An "asset" is a DRUG or COMPOUND being developed, identified by:
+- A code name (e.g., "ABL001", "ORM-1153", "SKI-O-703")
+- A proprietary drug name (e.g., "Lazertinib", "Cevidoplenib")
+- "TBD" or "Undisclosed" if the drug name is not yet announced - INCLUDE THESE
 
-For visual phase indicators:
-- Solid filled section = completed
-- Partial fill or current marker = ongoing
-- Map to: Preclinical, Phase 1, Phase 1/2, Phase 2, Phase 2/3, Phase 3, Filed, Approved
+Do NOT create assets from:
+- Disease names alone (these are INDICATIONS)
+- Target names alone (these are THERAPEUTIC TARGETS)
+- Modality types alone (these are MODALITIES)
 
-CRITICAL: Do NOT miss any assets. Extract EVERY drug/compound code visible in the image, even if details are limited. Use empty string for unknown fields.
+MULTIPLE INDICATIONS:
+- Same phase: combine with semicolons (e.g., "NSCLC; Breast Cancer")
+- Different phases: create separate entries
 
-Return JSON matching schema."""
+Look for assets in:
+- Pipeline tables/charts with phase columns
+- Honeycomb/hexagon diagrams
+- Bar charts showing development stages
+- Text descriptions of programs
+- Partnership/deal sections mentioning specific drugs
 
+For each DRUG asset extract:
+- asset_name: Drug code or name ("TBD" if undisclosed)
+- therapeutic_area: e.g., "Oncology", "Neurology"
+- modality: e.g., "Small molecule", "Bispecific Antibody"
+- phase: Preclinical, IND-enabling, Phase 1, Phase 1/2, Phase 2, Phase 3, Filed, Approved
+- description: Mechanism of action
+- therapeutic_target: Molecular target (e.g., "CD33", "EGFR"). If target is undisclosed/masked (e.g., "Target A"), use empty string.
+- indication: The DISEASE being treated (e.g., "AML", "NSCLC"). Must be a disease/condition, NOT a target, NOT a modality, NOT a treatment regimen. If undisclosed, use empty string.
 
-async def extract_with_text(
-    text: str,
-    company: str,
-    url: str,
-    retry_errors: list[str] = None,
-) -> PipelineResponse:
-    """LLM extraction from text with validation retry."""
-    prompt = EXTRACTION_PROMPT.format(company=company, url=url, content=text[:40000])
+DEDUPLICATION: Each unique drug should appear ONLY ONCE. If the same drug appears in multiple tiles (overlapping screenshots), extract it only from the first occurrence.
 
-    if retry_errors:
-        prompt += f"\n\nPrevious attempt had errors - please fix:\n" + "\n".join(retry_errors)
-
-    response = await client.chat.completions.create(
-        model=config.text_model,
-        messages=[
-            {"role": "system", "content": "You extract pharma pipeline data. Return valid JSON only."},
-            {"role": "user", "content": prompt}
-        ],
-        response_format={
-            "type": "json_schema",
-            "json_schema": {"name": "pipeline_assets", "strict": True, "schema": SCHEMA}
-        }
-    )
-    return PipelineResponse.model_validate_json(response.choices[0].message.content)
+CRITICAL: Do NOT miss any assets. Extract EVERY drug visible across all screenshots.
+Use empty string for unknown fields."""
 
 
 async def extract_with_vision(
-    screenshot: bytes,
+    screenshots: list[bytes],
     company: str,
+    url: str,
+    text: str = "",
 ) -> PipelineResponse:
-    """Vision model extraction for image-heavy pages."""
-    b64 = base64.b64encode(screenshot).decode()
+    """Vision extraction from tiled screenshots."""
+    content_parts = []
+
+    # Add each screenshot tile
+    for i, shot in enumerate(screenshots):
+        b64 = base64.b64encode(shot).decode()
+        content_parts.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{b64}"}
+        })
+
+    # Add any extracted text as supplementary context
+    if text and len(text) > 100:
+        content_parts.append({
+            "type": "text",
+            "text": f"Supplementary text from same page:\n{text[:10000]}"
+        })
+
+    content_parts.append({
+        "type": "text",
+        "text": f"Extract all pipeline assets from these {len(screenshots)} screenshot tiles of the page."
+    })
 
     response = await client.chat.completions.create(
         model=config.vision_model,
         messages=[
-            {"role": "system", "content": VISION_PROMPT.format(company=company)},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                    {"type": "text", "text": "Extract all pipeline assets from this image."}
-                ]
-            }
+            {"role": "system", "content": VISION_PROMPT.format(company=company, url=url)},
+            {"role": "user", "content": content_parts}
         ],
         response_format={
             "type": "json_schema",
@@ -151,6 +152,29 @@ async def extract_with_vision(
         }
     )
     return PipelineResponse.model_validate_json(response.choices[0].message.content)
+
+
+async def extract_with_text(text: str, company: str, url: str) -> list[ExtractedAsset]:
+    """Text-only extraction — fast (~3s), cheap, works great for HTML tables."""
+    try:
+        response = await client.chat.completions.create(
+            model=config.text_model,
+            messages=[{"role": "user", "content": TEXT_PROMPT.format(
+                company=company, url=url, text=text[:15000],
+            )}],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "pipeline_assets", "strict": True, "schema": SCHEMA}
+            },
+        )
+        result = PipelineResponse.model_validate_json(response.choices[0].message.content)
+        return [
+            ExtractedAsset.from_llm(a, company=company, source_url=url, extraction_method="text")
+            for a in result.assets
+        ]
+    except Exception as e:
+        print(f"    Text extraction failed: {e}")
+        return []
 
 
 async def extract_from_content(
@@ -158,29 +182,35 @@ async def extract_from_content(
     company: str,
     url: str,
 ) -> list[ExtractedAsset]:
-    """Extract assets from fetched content with retry loop."""
+    """Extract assets — text-first, vision fallback."""
     if content.method == "failed":
         return []
 
-    # Determine extraction method
-    use_vision = content.method == "vision_needed" and content.screenshot
-    method = "vision" if use_vision else "text"
+    # Fast path: text-only extraction if page has rich text (tables, lists)
+    if content.text and len(content.text) >= config.hybrid_threshold:
+        text_assets = await extract_with_text(content.text, company, url)
+        if text_assets:
+            print(f"    Text extraction: {len(text_assets)} assets (fast path)")
+            return text_assets
+        print(f"    Text extraction yielded 0 — falling back to vision")
+
+    # Vision fallback for graphical pages
+    if not content.screenshots:
+        return []
 
     errors = []
     for attempt in range(config.max_retries):
         try:
-            if use_vision:
-                result = await extract_with_vision(content.screenshot, company)
-            else:
-                result = await extract_with_text(content.text, company, url, errors if errors else None)
+            result = await extract_with_vision(
+                content.screenshots, company, url, content.text
+            )
 
-            # Convert LLMAsset to ExtractedAsset with metadata
             assets = [
                 ExtractedAsset.from_llm(
                     llm_asset,
                     company=company,
                     source_url=url,
-                    extraction_method=method,
+                    extraction_method="vision",
                 )
                 for llm_asset in result.assets
             ]
@@ -201,22 +231,15 @@ async def extract_from_content(
 
 
 def normalize_asset_name(name: str) -> str:
-    """Normalize asset name for matching - remove parenthetical codes."""
+    """Normalize asset name for matching."""
     import re
-    # Remove parenthetical content like "(TTAC-0001)"
     name = re.sub(r'\s*\([^)]+\)', '', name)
-    # Remove trailing codes after space
     name = name.split()[0] if name else name
     return name.strip().upper()
 
 
 def merge_assets(existing: list[ExtractedAsset], new: list[ExtractedAsset]) -> list[ExtractedAsset]:
-    """
-    Merge new assets into existing list.
-    Only updates existing assets with more detail - does NOT add new ones.
-    Matches by normalized asset name (ignores phase for matching).
-    """
-    # Index by normalized asset name
+    """Merge new assets into existing list (only updates, no new additions)."""
     by_name = {}
     for a in existing:
         norm_name = normalize_asset_name(a.asset_name)
@@ -226,99 +249,74 @@ def merge_assets(existing: list[ExtractedAsset], new: list[ExtractedAsset]) -> l
     for asset in new:
         norm_name = normalize_asset_name(asset.asset_name)
         if norm_name in by_name:
-            # Merge: prefer non-empty values from new
             old = by_name[norm_name]
             for field in ["therapeutic_area", "modality", "description",
                           "therapeutic_target", "indication"]:
                 new_val = getattr(asset, field)
                 old_val = getattr(old, field)
-                # Update if new has value and old is empty/TBD/Undisclosed
                 if new_val and new_val not in ["", "TBD", "Undisclosed"]:
                     if not old_val or old_val in ["", "TBD", "Undisclosed"]:
                         setattr(old, field, new_val)
                     elif new_val not in old_val:
-                        # Append if different (for multiple indications)
                         setattr(old, field, f"{old_val}; {new_val}")
-        # Skip assets not in overview
 
     return list(by_name.values())
+
+
+def deduplicate_assets(assets: list[ExtractedAsset]) -> list[ExtractedAsset]:
+    """Remove duplicate assets (same drug extracted from overlapping tiles)."""
+    seen = {}
+    for a in assets:
+        key = normalize_asset_name(a.asset_name)
+        if not key or key in ("TBD", "UNDISCLOSED"):
+            seen[id(a)] = a  # keep all unnamed assets
+            continue
+        if key not in seen:
+            seen[key] = a
+        else:
+            # Merge richer data into existing
+            existing = seen[key]
+            for field in ["therapeutic_area", "modality", "description",
+                          "therapeutic_target", "indication"]:
+                new_val = getattr(a, field)
+                old_val = getattr(existing, field)
+                if new_val and new_val not in ("", "TBD", "Undisclosed") and (
+                    not old_val or old_val in ("", "TBD", "Undisclosed")
+                ):
+                    setattr(existing, field, new_val)
+    return list(seen.values())
 
 
 async def extract_pipeline(
     overview_url: str,
     company: str,
-    drug_urls: list[str] = None,
-    max_drug_pages: int = None,
-) -> list[ExtractedAsset]:
+) -> tuple[list[ExtractedAsset], list[str]]:
+    """Extract pipeline assets + drug page links from overview page.
+
+    Returns (assets, drug_page_links) tuple.
     """
-    Extract pipeline assets from overview + optional drug-specific pages.
-
-    Args:
-        overview_url: Main pipeline page URL
-        company: Company name
-        drug_urls: Optional list of drug-specific page URLs
-        max_drug_pages: Max drug pages to fetch (default from config)
-
-    Returns:
-        List of ExtractedAsset objects
-    """
-    if max_drug_pages is None:
-        max_drug_pages = config.max_drug_pages_per_company
-
-    # Fetch and extract from overview
     print(f"  Fetching overview: {overview_url}")
     overview_content = await fetch_content(overview_url)
     assets = await extract_from_content(overview_content, company, overview_url)
-    print(f"  Found {len(assets)} assets from overview [{overview_content.method}]")
+    before = len(assets)
+    assets = deduplicate_assets(assets)
+    deduped = before - len(assets)
 
-    # Discover drug page links if not provided
-    if drug_urls is None and overview_content.links:
-        drug_urls = filter_pipeline_links(overview_url, overview_content.links, company)
-        print(f"  Discovered {len(drug_urls)} drug page links")
+    # Extract drug page links from overview HTML for enrichment
+    drug_links = filter_pipeline_links(overview_url, overview_content.links, company) if overview_content.links else []
 
-    # Fetch drug-specific pages in parallel
-    if drug_urls:
-        drug_urls = drug_urls[:max_drug_pages]
-        print(f"  Fetching {len(drug_urls)} drug pages...")
-
-        tasks = [fetch_content(url) for url in drug_urls]
-        drug_contents = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for url, content in zip(drug_urls, drug_contents):
-            if isinstance(content, Exception):
-                continue
-            if content.method != "failed":
-                drug_assets = await extract_from_content(content, company, url)
-                if drug_assets:
-                    assets = merge_assets(assets, drug_assets)
-
-    return assets
-
-
-async def extract_pipeline_for_company(
-    company: str,
-    urls: list[str],
-) -> list[ExtractedAsset]:
-    """
-    High-level extraction for a company given discovered URLs.
-
-    Picks best overview URL and extracts from it + drug pages.
-    """
-    if not urls:
-        print(f"  No URLs for {company}")
-        return []
-
-    # First URL should be overview (already sorted by discovery)
-    overview_url = urls[0]
-
-    # Rest could be drug-specific
-    drug_urls = urls[1:] if len(urls) > 1 else None
-
-    return await extract_pipeline(overview_url, company, drug_urls)
+    method = assets[0].extraction_method if assets else "none"
+    msg = f"  Found {len(assets)} assets via {method}"
+    if deduped:
+        msg += f" ({deduped} dupes removed)"
+    if drug_links:
+        msg += f", {len(drug_links)} drug page links"
+    print(msg)
+    return assets, drug_links
 
 
 # Sync wrapper for testing
-def extract_pipeline_sync(overview_url: str, company: str) -> list[ExtractedAsset]:
+def extract_pipeline_sync(overview_url: str, company: str) -> tuple[list[ExtractedAsset], list[str]]:
     """Synchronous wrapper for extract_pipeline."""
     async def run():
         result = await extract_pipeline(overview_url, company)

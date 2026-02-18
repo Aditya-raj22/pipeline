@@ -1,0 +1,6 @@
+.env
+.cache/
+__pycache__/
+*.pyc
+pipeline_output*.xlsx
+pipeline_output*.txt

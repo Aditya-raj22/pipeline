@@ -12,18 +12,14 @@ from models.schema import UserSchema
 from services.discovery import discover_pipeline_urls
 from services.extraction import extract_pipeline
 from services.schema_mapper import map_and_normalize
-from services.enrichment import enrich_assets, merge_enrichment_results
+from services.drug_pages import enrich_from_drug_pages
 from utils.fetch import close_browser
 
-app = FastAPI(
-    title="Pipeline Sourcer API",
-    description="Pharma pipeline extraction system",
-    version="2.0",
-)
+app = FastAPI(title="Pipeline Sourcer API", version="3.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -36,275 +32,134 @@ class PipelineEntry(BaseModel):
 
 class PipelineRequest(BaseModel):
     entries: list[PipelineEntry] = []
-    companies: list[str] = []  # Legacy support
-    enrich: bool = True
-    deep_fetch: bool = True
+    companies: list[str] = []
+    drug_pages: bool = False
 
 
-class Asset(BaseModel):
-    therapeutic_area: str = ""
-    modality: str = ""
-    phase: str = ""
-    asset_name: str = ""
-    description: str = ""
-    therapeutic_target: str = ""
-    indication: str = ""
-    company: str = ""
-    latest_news: str = ""
-    sources: str = ""
-
-
-class PipelineResponse(BaseModel):
-    assets: list[dict]
-    companies_processed: int
-    message: str = ""
-
-
-async def process_company(
-    company: str,
-    schema: UserSchema,
-    enrich: bool = True,
-    deep_fetch: bool = True,
-) -> list[dict]:
-    """Process single company through pipeline."""
-    # Discover URLs
-    urls = await discover_pipeline_urls(company)
-    if not urls:
-        return []
-
-    overview = next((u for u in urls if u.url_type == "overview"), urls[0])
-    drug_urls = [u.url for u in urls if u.url_type == "drug_specific"]
-
-    # Extract assets
-    assets = await extract_pipeline(
-        overview.url,
-        company,
-        drug_urls=drug_urls[:config.max_drug_pages_per_company],
-    )
-    if not assets:
-        return []
-
-    # Map to schema
-    mapped = map_and_normalize(assets, schema)
-
-    # Enrich
-    if enrich:
-        results = await enrich_assets(mapped, company, deep_fetch=deep_fetch)
-        enriched, _ = merge_enrichment_results(results)
-        return enriched
-
-    return mapped
+RESULT_COLUMNS = [
+    "Asset Name", "Phase", "Therapeutic Area", "Modality",
+    "Indication", "Therapeutic Target", "Description", "Company", "Sources",
+]
 
 
 def convert_to_frontend_format(assets: list[dict]) -> list[dict]:
-    """Convert internal format to frontend expected format."""
-    # Schema mapper already outputs correct keys, just ensure all fields exist
-    result = []
-    for a in assets:
-        result.append({
-            "Asset Name": a.get("Asset Name", a.get("asset_name", "")),
-            "Phase": a.get("Phase", a.get("phase", "")),
-            "Therapeutic Area": a.get("Therapeutic Area", a.get("therapeutic_area", "")),
-            "Modality": a.get("Modality", a.get("modality", "")),
-            "Indication": a.get("Indication", a.get("indication", "")),
-            "Therapeutic Target": a.get("Therapeutic Target", a.get("therapeutic_target", "")),
-            "Description": a.get("Description", a.get("description", "")),
-            "Company": a.get("Company", a.get("company", "")),
-            "Latest News": a.get("Latest News", a.get("latest_news", "")),
-            "Sources": a.get("Sources", a.get("sources", "")),
-        })
-    return result
-
-
-@app.post("/api/pipeline", response_model=PipelineResponse)
-async def run_pipeline(request: PipelineRequest):
-    """Run pipeline for given companies."""
-    if not request.companies:
-        raise HTTPException(status_code=400, detail="No companies provided")
-
-    schema = UserSchema.default()
-    all_assets = []
-
-    for company in request.companies:
-        try:
-            assets = await process_company(
-                company,
-                schema,
-                enrich=request.enrich,
-                deep_fetch=request.deep_fetch,
-            )
-            all_assets.extend(assets)
-        except Exception as e:
-            print(f"Error processing {company}: {e}")
-
-    # Clean up browser
-    await close_browser()
-
-    return PipelineResponse(
-        assets=convert_to_frontend_format(all_assets),
-        companies_processed=len(request.companies),
-        message=f"Processed {len(request.companies)} companies, found {len(all_assets)} assets",
-    )
-
-
-async def process_company_streaming(
-    company: str,
-    schema: UserSchema,
-    enrich: bool,
-    deep_fetch: bool,
-) -> AsyncGenerator[tuple[str, list[dict]], None]:
-    """Process company with streaming progress updates."""
-    # Discover URLs
-    yield f"[{company}] Discovering pipeline URLs...", []
-    urls = await discover_pipeline_urls(company)
-
-    if not urls:
-        yield f"[{company}] No pipeline URLs found", []
-        return
-
-    overview = next((u for u in urls if u.url_type == "overview"), urls[0])
-    drug_urls = [u.url for u in urls if u.url_type == "drug_specific"]
-    yield f"[{company}] Found overview + {len(drug_urls)} drug pages", []
-
-    # Extract assets
-    yield f"[{company}] Extracting pipeline data...", []
-    assets = await extract_pipeline(
-        overview.url,
-        company,
-        drug_urls=drug_urls[:config.max_drug_pages_per_company],
-    )
-
-    if not assets:
-        yield f"[{company}] No assets extracted", []
-        return
-
-    yield f"[{company}] Extracted {len(assets)} assets", []
-
-    # Map to schema
-    mapped = map_and_normalize(assets, schema)
-
-    # Enrich
-    if enrich:
-        yield f"[{company}] Enriching with web search...", []
-        results = await enrich_assets(mapped, company, deep_fetch=deep_fetch)
-        enriched, _ = merge_enrichment_results(results)
-        yield f"[{company}] Enrichment complete", enriched
-    else:
-        yield f"[{company}] Processing complete", mapped
+    return [
+        {col: a.get(col, "") for col in RESULT_COLUMNS}
+        for a in assets
+    ]
 
 
 def infer_company_from_url(url: str) -> str:
-    """Infer company name from URL domain."""
     from urllib.parse import urlparse
     try:
         domain = urlparse(url).netloc
-        # Remove www. and common TLDs
-        name = domain.replace("www.", "").split(".")[0]
-        # Capitalize and clean up
-        return name.title()
-    except:
+        return domain.replace("www.", "").split(".")[0].title()
+    except Exception:
         return "Unknown"
 
 
-async def process_with_url(
-    company: str,
-    url: str,
+async def _process_entry(
+    entry: PipelineEntry,
     schema: UserSchema,
-    enrich: bool,
-    deep_fetch: bool,
-) -> AsyncGenerator[tuple[str, list[dict]], None]:
-    """Process with direct URL (skip discovery)."""
-    # Infer company name from URL if not provided
-    if not company:
+    drug_pages: bool,
+    queue: asyncio.Queue,
+) -> list[dict]:
+    """Process one company/URL entry."""
+    company = entry.company
+    url = entry.url.strip() if entry.url else None
+
+    if url and not company:
         company = infer_company_from_url(url)
 
-    yield f"[{company}] Using provided URL: {url}", []
+    label = company or url or "Unknown"
 
-    # Extract assets directly
-    yield f"[{company}] Extracting pipeline data...", []
-    assets = await extract_pipeline(url, company)
+    try:
+        drug_links = []
+        if url:
+            await queue.put(f"[{company}] Using provided URL: {url}")
+            await queue.put(f"[{company}] Extracting pipeline data...")
+            assets, drug_links = await extract_pipeline(url, company)
+        else:
+            await queue.put(f"[{company}] Discovering pipeline URLs...")
+            urls = await discover_pipeline_urls(company)
+            if not urls:
+                await queue.put(f"[{company}] No pipeline URLs found")
+                return []
+            overview = next((u for u in urls if u.url_type == "overview"), urls[0])
+            await queue.put(f"[{company}] Found: {overview.url}")
+            await queue.put(f"[{company}] Extracting pipeline data...")
+            assets, drug_links = await extract_pipeline(overview.url, company)
 
-    if not assets:
-        yield f"[{company}] No assets extracted", []
-        return
+        if not assets:
+            await queue.put(f"[{company}] No assets extracted")
+            return []
 
-    yield f"[{company}] Extracted {len(assets)} assets", []
+        await queue.put(f"[{company}] Extracted {len(assets)} assets")
+        mapped = map_and_normalize(assets, schema)
 
-    # Map to schema
-    mapped = map_and_normalize(assets, schema)
+        if drug_pages:
+            async def on_progress(msg):
+                await queue.put(msg)
+            mapped = await enrich_from_drug_pages(mapped, company, on_progress=on_progress, overview_links=drug_links)
 
-    # Enrich
-    if enrich:
-        yield f"[{company}] Enriching with web search...", []
-        results = await enrich_assets(mapped, company, deep_fetch=deep_fetch)
-        enriched, _ = merge_enrichment_results(results)
-        yield f"[{company}] Enrichment complete", enriched
-    else:
-        yield f"[{company}] Processing complete", mapped
+        await queue.put(f"[{company}] Complete")
+        return mapped
+
+    except Exception as e:
+        await queue.put(f"[{label}] Error: {str(e)}")
+        return []
 
 
 async def stream_pipeline(request: PipelineRequest) -> AsyncGenerator[str, None]:
-    """Stream pipeline progress as SSE events."""
     schema = UserSchema.default()
-    all_assets = []
-
-    # Handle both new entries format and legacy companies format
     entries = request.entries if request.entries else [PipelineEntry(company=c) for c in request.companies]
     total = len(entries)
+    queue: asyncio.Queue = asyncio.Queue()
 
-    for i, entry in enumerate(entries):
-        company = entry.company
-        url = entry.url
-        label = company or url or f"Entry {i+1}"
-        progress = int((i / total) * 80)
-        yield f"data: {json.dumps({'type': 'log', 'message': f'Processing {label} ({i+1}/{total})...', 'progress': progress})}\n\n"
+    async def run_serial():
+        all_assets = []
+        for i, entry in enumerate(entries):
+            progress = int((i / total) * 80)
+            label = entry.company or entry.url or f"Entry {i+1}"
+            await queue.put(json.dumps({"type": "log", "message": f"Processing {label} ({i+1}/{total})...", "progress": progress}))
+            try:
+                assets = await _process_entry(entry, schema, request.drug_pages, queue)
+                all_assets.extend(assets)
+            except Exception as e:
+                await queue.put(json.dumps({"type": "log", "message": f"[{label}] Error: {e}"}))
+        await close_browser()
+        await queue.put(json.dumps({
+            "type": "complete",
+            "assets": convert_to_frontend_format(all_assets),
+        }))
+        await queue.put(None)
 
-        try:
-            if url:
-                # Direct URL provided - skip discovery
-                async for message, assets in process_with_url(
-                    company, url, schema, request.enrich, request.deep_fetch
-                ):
-                    yield f"data: {json.dumps({'type': 'log', 'message': message})}\n\n"
-                    if assets:
-                        all_assets.extend(assets)
-            elif company:
-                # No URL - use discovery
-                async for message, assets in process_company_streaming(
-                    company, schema, request.enrich, request.deep_fetch
-                ):
-                    yield f"data: {json.dumps({'type': 'log', 'message': message})}\n\n"
-                    if assets:
-                        all_assets.extend(assets)
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'log', 'message': f'[{label}] Error: {str(e)}'})}\n\n"
+    asyncio.create_task(run_serial())
 
-    # Clean up
-    await close_browser()
-
-    # Send final result
-    yield f"data: {json.dumps({'type': 'complete', 'assets': convert_to_frontend_format(all_assets)})}\n\n"
+    while True:
+        item = await queue.get()
+        if item is None:
+            break
+        if item.startswith("{"):
+            yield f"data: {item}\n\n"
+        else:
+            yield f"data: {json.dumps({'type': 'log', 'message': item})}\n\n"
 
 
 @app.post("/api/pipeline/stream")
 async def run_pipeline_stream(request: PipelineRequest):
-    """Stream pipeline progress for given companies."""
     if not request.entries and not request.companies:
         raise HTTPException(status_code=400, detail="No entries provided")
 
     return StreamingResponse(
         stream_pipeline(request),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-        }
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
 
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
     return {"status": "ok"}
 
 

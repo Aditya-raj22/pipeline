@@ -1,8 +1,7 @@
-"""Content fetching utilities with 3-tier fallback."""
+"""Content fetching - Playwright with tiled screenshots for vision extraction."""
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
-import httpx
 from bs4 import BeautifulSoup
 from config import config
 from utils.cache import get_cached, set_cache
@@ -11,19 +10,25 @@ from utils.cache import get_cached, set_cache
 _playwright = None
 _browser = None
 
+TILE_HEIGHT = 900   # px per screenshot tile
+TILE_OVERLAP = 100  # px overlap to avoid cutting rows
+MAX_TILES = 5       # cap tiles to keep cost reasonable
+VIEWPORT_WIDTH = 1280
+
 
 @dataclass
 class FetchResult:
     """Result from content fetch."""
     text: str
     html: str
-    screenshot: Optional[bytes]
-    method: str  # "cache", "http", "playwright", "vision_needed", "failed"
-    links: list[str] = None  # Links found on page
+    screenshots: list[bytes] = field(default_factory=list)
+    method: str = ""  # "playwright", "failed"
+    links: list[str] = field(default_factory=list)
 
-    def __post_init__(self):
-        if self.links is None:
-            self.links = []
+    # Back-compat: single screenshot property
+    @property
+    def screenshot(self) -> Optional[bytes]:
+        return self.screenshots[0] if self.screenshots else None
 
 
 async def get_browser():
@@ -48,38 +53,27 @@ async def close_browser():
 
 
 def clean_html(html: str) -> tuple[str, list[str]]:
-    """
-    Extract meaningful text and links from HTML.
-
-    Returns: (text, list of links)
-    """
+    """Extract text and links from HTML."""
     import re
     soup = BeautifulSoup(html, "html.parser")
 
-    # Extract links from anchor tags
+    # Extract links
     links = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if href and not href.startswith(("#", "javascript:", "mailto:")):
             links.append(href)
 
-    # Also extract links from onclick handlers and other attributes
-    # This catches JS-based navigation
     for tag in soup.find_all(onclick=True):
         onclick = tag.get("onclick", "")
-        # Find URLs in onclick handlers
         urls = re.findall(r"['\"]([^'\"]*\.php[^'\"]*)['\"]", onclick)
         links.extend(urls)
-
-    # Find URL patterns in raw HTML (for JS-constructed links)
-    url_patterns = re.findall(r'(?:href|src|url)[=:]\s*["\']?([^"\'>\s]+\.php)', html, re.IGNORECASE)
-    links.extend(url_patterns)
 
     # Remove non-content elements
     for tag in soup(["script", "style", "nav", "footer", "header", "aside", "noscript"]):
         tag.decompose()
 
-    # Prioritize main content areas
+    # Prioritize main content
     main = (
         soup.find("main") or
         soup.find("article") or
@@ -88,7 +82,7 @@ def clean_html(html: str) -> tuple[str, list[str]]:
     if main:
         soup = main
 
-    # Extract tables specially (common for pipeline data)
+    # Extract tables specially
     tables = soup.find_all("table")
     table_text = ""
     for table in tables:
@@ -105,108 +99,84 @@ def clean_html(html: str) -> tuple[str, list[str]]:
     return text[:50000], links
 
 
-async def fetch_with_httpx(url: str) -> tuple[str, int]:
-    """Fast async HTTP fetch. Returns (html, status_code)."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-    async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
-        resp = await client.get(url, headers=headers)
-        return resp.text, resp.status_code
+async def fetch_content(url: str, use_cache: bool = True) -> FetchResult:
+    """
+    Fetch page with Playwright and take tiled screenshots.
 
+    For long pages, takes multiple viewport-height screenshots with overlap
+    so no content is lost. Text is also extracted for links/context.
+    """
+    # Check cache - but we still need screenshots for extraction
+    # Cache is only useful for link discovery / text fallback
+    cached_text = None
+    if use_cache:
+        cached = get_cached(url)
+        if cached:
+            cached_text = cached["content"]
 
-async def fetch_with_playwright(url: str) -> tuple[str, Optional[bytes]]:
-    """JS rendering + screenshot. Returns (html, screenshot_bytes)."""
-    import asyncio as aio
-
-    browser = await get_browser()
-    page = await browser.new_page()
     try:
-        # Try networkidle first, fall back to domcontentloaded
+        browser = await get_browser()
+        page = await browser.new_page(viewport={"width": VIEWPORT_WIDTH, "height": TILE_HEIGHT})
+
         try:
             await page.goto(url, wait_until="networkidle", timeout=30000)
         except Exception:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            # Wait a bit for JS to execute
-            await aio.sleep(3)
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(3)
+            except Exception:
+                await page.close()
+                return FetchResult(text=cached_text or "", html="", method="failed")
 
-        # Additional wait for Cloudflare challenges
+        # Wait for Cloudflare / JS
         for _ in range(5):
             content = await page.content()
             if "Just a moment" not in content and len(content) > 1000:
                 break
-            await aio.sleep(2)
+            await asyncio.sleep(2)
 
         html = await page.content()
-        screenshot = await page.screenshot(full_page=True, type="png")
-        return html, screenshot
-    finally:
+        text, links = clean_html(html)
+
+        # Use cached text if richer
+        if cached_text and len(cached_text) > len(text):
+            text = cached_text
+        else:
+            set_cache(url, text)
+
+        # Get page height for tiling
+        page_height = await page.evaluate("document.body.scrollHeight")
+        stride = TILE_HEIGHT - TILE_OVERLAP
+
+        # Calculate tile positions
+        tiles = []
+        y = 0
+        while y < page_height and len(tiles) < MAX_TILES:
+            tiles.append(y)
+            y += stride
+
+        # Take tiled screenshots
+        screenshots = []
+        for y_offset in tiles:
+            await page.evaluate(f"window.scrollTo(0, {y_offset})")
+            await asyncio.sleep(0.3)  # let render settle
+            shot = await page.screenshot(type="png")
+            screenshots.append(shot)
+
         await page.close()
 
-
-async def fetch_content(url: str, use_cache: bool = True) -> FetchResult:
-    """
-    Three-tier fetch: Cache -> HTTP -> JS rendering -> Vision needed
-
-    Returns FetchResult with text, screenshot (if needed), and method used.
-    """
-    # Check cache first
-    if use_cache:
-        cached = get_cached(url)
-        if cached:
-            return FetchResult(
-                text=cached["content"],
-                html="",
-                screenshot=None,
-                method="cache",
-            )
-
-    # Tier 1: Fast HTTP
-    html = ""
-    try:
-        html, status = await fetch_with_httpx(url)
-        text, links = clean_html(html)
-
-        if len(text) >= config.text_threshold:
-            set_cache(url, text)
-            return FetchResult(
-                text=text,
-                html=html,
-                screenshot=None,
-                method="http",
-                links=links,
-            )
-    except Exception as e:
-        pass  # Fall through to playwright
-
-    # Tier 2: JS rendering
-    try:
-        html, screenshot = await fetch_with_playwright(url)
-        text, links = clean_html(html)
-
-        if len(text) >= config.vision_threshold:
-            set_cache(url, text)
-            return FetchResult(
-                text=text,
-                html=html,
-                screenshot=screenshot,
-                method="playwright",
-                links=links,
-            )
-
-        # Text too short, vision needed
         return FetchResult(
             text=text,
             html=html,
-            screenshot=screenshot,
-            method="vision_needed",
+            screenshots=screenshots,
+            method="playwright",
             links=links,
         )
+
     except Exception as e:
         return FetchResult(
-            text="",
+            text=cached_text or "",
             html="",
-            screenshot=None,
             method="failed",
         )
 
@@ -218,20 +188,14 @@ def resolve_url(base_url: str, href: str) -> str:
 
 
 def filter_pipeline_links(base_url: str, links: list[str], company: str) -> list[str]:
-    """
-    Filter links to find likely drug/pipeline detail pages.
-
-    Returns list of absolute URLs.
-    """
+    """Filter links to find likely drug/pipeline detail pages."""
     import re
     from urllib.parse import urlparse
 
     base_domain = urlparse(base_url).netloc
     pipeline_links = []
 
-    # Patterns for drug codes (e.g., PMC-309, NCP101, ABL001, HL036)
     drug_code_pattern = re.compile(r'^/?[A-Z]{2,4}[-_]?\d{2,4}[A-Za-z]?$', re.IGNORECASE)
-    # Pattern for drug names (single capitalized word, 5+ chars)
     drug_name_pattern = re.compile(r'^/?[A-Z][a-z]{4,}$')
 
     skip_patterns = [
@@ -245,28 +209,22 @@ def filter_pipeline_links(base_url: str, links: list[str], company: str) -> list
         url = resolve_url(base_url, href)
         parsed = urlparse(url)
 
-        # Must be same domain
         if parsed.netloc != base_domain:
             continue
 
         path = parsed.path
         path_lower = path.lower()
 
-        # Skip common non-drug pages
         if any(skip in path_lower for skip in skip_patterns):
             continue
 
-        # Check for pipeline/drug page patterns
         is_pipeline_page = any(pattern in path_lower for pattern in [
             "pipeline", "product", "drug", "candidate", "program",
             "rnd", "r-d", "research", "development"
         ])
 
-        # Check for drug code pattern (e.g., /PMC-309, /NCP101)
         path_segment = path.rstrip('/').split('/')[-1] if path else ""
         is_drug_code = bool(drug_code_pattern.match(path_segment))
-
-        # Check for drug name pattern (e.g., /Olinvacimab)
         is_drug_name = bool(drug_name_pattern.match(path_segment)) and len(path_segment) > 5
 
         if (is_pipeline_page or is_drug_code or is_drug_name):

@@ -3,6 +3,7 @@ import re
 import pandas as pd
 from datetime import datetime
 from pathlib import Path
+from openpyxl.utils import get_column_letter
 from models.schema import UserSchema
 
 
@@ -45,10 +46,9 @@ def export_to_excel(
         print("No assets to export")
         return None
 
-    # Define column order: schema fields + enrichment fields
+    # Define column order: schema fields + sources
     base_columns = schema.column_order()
-    extra_columns = ["Latest News", "Sources"]
-    all_columns = base_columns + extra_columns
+    all_columns = base_columns + ["Sources"]
 
     # Create DataFrame
     df = pd.DataFrame(assets)
@@ -87,7 +87,7 @@ def export_to_excel(
             )
             # Cap at 50 chars
             adjusted_width = min(max_length + 2, 50)
-            worksheet.column_dimensions[chr(65 + idx)].width = adjusted_width
+            worksheet.column_dimensions[get_column_letter(idx + 1)].width = adjusted_width
 
     print(f"Exported {len(df)} assets to {output_path}")
     return str(output_path)
