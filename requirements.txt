@@ -8,4 +8,5 @@ openpyxl
 playwright
 fastapi
 uvicorn[standard]
+duckduckgo-search
 streamlit>=1.38.0
